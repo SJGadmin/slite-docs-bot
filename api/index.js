@@ -1,9 +1,7 @@
-import OpenAI from "openai";
+import OpenAI from "openai"; // keep installed for later; not used in this minimal sync reply
 
-const oai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const SLITE_BASE = "https://api.slite.com";
 
-// --- Slite helpers ---
 async function sliteSearch(query, hits = 3) {
   const r = await fetch(`${SLITE_BASE}/v1/notes.search`, {
     method: "POST",
@@ -30,7 +28,7 @@ async function sliteGet(noteId) {
   return r.json();
 }
 
-// Slack sends application/x-www-form-urlencoded by default
+// Parse Slack's x-www-form-urlencoded
 function parseSlashBody(req) {
   const raw =
     typeof req.body === "string" ? req.body :
@@ -38,88 +36,60 @@ function parseSlashBody(req) {
     "";
   const params = new URLSearchParams(raw);
   const text = params.get("text") || (req.body && req.body.text) || "";
-  const response_url = params.get("response_url") || (req.body && req.body.response_url);
-  return { text: (text || "").trim(), response_url };
+  return { text: (text || "").trim() };
 }
 
-// Vercel serverless handler
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Use POST");
 
-  const { text, response_url } = parseSlashBody(req);
-
-  // Acknowledge immediately so Slack doesn't timeout
-  res.status(200).send("");
-
-  if (!response_url) {
-    // fallback for manual tests
-    return;
-  }
-
-  if (!text) {
-    await fetch(response_url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: "Usage: `/ask your question`" })
-    });
-    return;
-  }
-
   try {
-    // 1) Search Slite
+    const { text } = parseSlashBody(req);
+
+    if (!text) {
+      return res.status(200).json({
+        response_type: "ephemeral",
+        text: "Usage: `/ask your question`"
+      });
+    }
+
+    // Catch broad/vague asks up front
+    const generic = /\b(how to work a lead|lead process|work a lead|buyer lead|seller lead)\b/i.test(text);
+    if (generic) {
+      return res.status(200).json({
+        response_type: "ephemeral",
+        text: "There isn’t a document with that information directly. Can you be more specific so I can find what you need? (e.g., *LSA Message*, *Google PPC buyer*, *Open House sign-in*)"
+      });
+    }
+
+    // Quick Slite lookup (fast and synchronous)
     const search = await sliteSearch(text, 3);
     const hits = search?.hits ?? [];
 
-    // Simple generic query rule
-    const generic = /(how to work a lead|lead process|work a lead)/i.test(text);
-    if (hits.length === 0 || generic) {
-      await fetch(response_url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text: "There isn’t a document with that information directly. Can you be more specific so I can find what you need?"
-        })
+    if (!hits.length) {
+      return res.status(200).json({
+        response_type: "ephemeral",
+        text: "There isn’t a document with that information directly. Can you be more specific so I can find what you need?"
       });
-      return;
     }
 
-    // 2) Fetch the top doc and trim
-    const first = await sliteGet(hits[0].noteId);
-    const md = first?.note?.content?.markdown || first?.note?.content?.text || "";
-    const excerpt = md.slice(0, 4000);
+    // Fetch the top doc's title + a short excerpt (no LLM, super fast)
+    const top = await sliteGet(hits[0].noteId);
+    const title = top?.note?.title || "Document";
+    const md = top?.note?.content?.markdown || top?.note?.content?.text || "";
+    const snippet = (md || "").replace(/\s+/g, " ").slice(0, 280);
 
-    // 3) Ask OpenAI with strict grounding
-    const system = `
-You are an internal assistant.
-Answer ONLY using the provided Slite excerpt.
-If the answer is not present, reply exactly:
-"There isn’t a document with that information directly. Can you be more specific so I can find what you need?"
-Do NOT use web or outside knowledge. Be concise. Temperature=0.
-`;
+    // If you have public Share URLs, you can append them here.
+    // Otherwise we just show the title/snippet. Slack user clicks through in Slite.
 
-    const completion = await oai.chat.completions.create({
-      model: "gpt-4o-mini",
-      temperature: 0,
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: `Question: ${text}\n\nExcerpt from Slite:\n${excerpt}` }
-      ]
+    return res.status(200).json({
+      response_type: "ephemeral",
+      text: `*Top match:* ${title}\n${snippet ? `> ${snippet}…` : ""}\n\nIf this isn’t it, tell me the specific lead source (e.g., *LSA Message*, *Google PPC buyer*, *Zillow/Flex*).`
     });
 
-    const out =
-      completion.choices?.[0]?.message?.content?.trim() ||
-      "There isn’t a document with that information directly. Can you be more specific so I can find what you need?";
-
-    await fetch(response_url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: out })
-    });
   } catch (err) {
-    await fetch(response_url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: `❌ Error: ${err.message || err}` })
+    return res.status(200).json({
+      response_type: "ephemeral",
+      text: `❌ Error: ${err.message || String(err)}`
     });
   }
 }
