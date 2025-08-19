@@ -1,0 +1,8 @@
+{
+  "name": "slite-docs-bot",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "openai": "^4.58.0"
+  }
+}
